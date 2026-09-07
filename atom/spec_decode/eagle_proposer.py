@@ -485,11 +485,26 @@ class EagleProposer(Drafter):
         cu_seqlens_q[: running_bs + 1] = builder.row_ids[: running_bs + 1]
         if target_uses_mla and has_flat_kv:
             # MLA: block_size=1, kv_indptr tracks tokens
-            # Per REAL request: `num_reject_tokens` is scheduled_bs-long, a pad row
-            # rejected nothing. Their `kv_indptr` keeps what the target left,
-            # which is one of its own valid ranges, so their reads stay in
-            # bounds; their WRITES are what has to be neutralized, below.
+            # Per REAL request: `num_reject_tokens` is scheduled_bs-long, a pad
+            # row rejected nothing. Their WRITES are neutralized below.
             kv_indptr[1 : scheduled_bs + 1] -= torch.cumsum(num_reject_tokens, dim=0)
+            # A pad row's entry is still a range from whatever batch last used
+            # that row, unrelated to the real rows just rebased above. Once the
+            # real rows total more tokens than that stale value the tail runs
+            # BACKWARDS, so the pad row's length comes out negative and sparse
+            # decode turns it into a wild kv_start/kv_end -- a long request
+            # landing on a bucket a short batch left behind is enough. One token
+            # per pad row keeps the array monotonic, on a slot
+            # `kv_indices_generate_triton` fills from block_tables.
+            if running_bs > scheduled_bs:
+                kv_indptr[scheduled_bs + 1 : running_bs + 1] = kv_indptr[
+                    scheduled_bs
+                ] + torch.arange(
+                    1,
+                    running_bs - scheduled_bs + 1,
+                    device=kv_indptr.device,
+                    dtype=kv_indptr.dtype,
+                )
         if positions.ndim == 1:
             positions = torch.index_select(positions, 0, last_token_indices)
         else:
